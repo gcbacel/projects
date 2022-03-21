@@ -1,0 +1,577 @@
+---
+title: "Project 4 - Recommender System"
+author: 'Student: Gunther Correia Bacellar, NetID: gunther6'
+date: "CS598, Fall 2020"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    theme: readable
+    toc: yes
+    toc_float: yes
+---
+***
+---
+
+In this project we will explore different movie recommendation systems using the MovieLens dataset with 1 million anonymous ratings of approximately 3,900 movies made by 6,040 users.
+
+# 1. Exploratory Data Analysis
+
+### 1.1 Read and preprocess movies dataset
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1234)
+library(dplyr)
+library(ggplot2)
+library(recommenderlab)
+library(DT)
+library(data.table)
+library(reshape2)
+library(patchwork)
+library(tidyr)
+library(stringr)
+library(foreach)
+library(doParallel)
+library(doFuture)
+
+myurl = "https://liangfgithub.github.io/MovieData/"
+ratings = read.csv(paste0(myurl, 'ratings.dat?raw=true'), sep = ':',
+                   colClasses = c('integer', 'NULL'), header = FALSE)
+colnames(ratings) = c('UserID', 'MovieID', 'Rating', 'Timestamp')
+movies = readLines(paste0(myurl, 'movies.dat?raw=true'))
+movies = strsplit(movies, split = "::", fixed = TRUE, useBytes = TRUE)
+movies = matrix(unlist(movies), ncol = 3, byrow = TRUE)
+movies = data.frame(movies, stringsAsFactors = FALSE)
+colnames(movies) = c('MovieID', 'Title', 'Genres')
+movies$MovieID = as.integer(movies$MovieID)
+movies$item = paste0("i",movies$MovieID)
+movies$Title = iconv(movies$Title, "latin1", "UTF-8")
+movies$Year = as.numeric(unlist(
+  lapply(movies$Title, function(x) substr(x, nchar(x)-4, nchar(x)-1))))
+dim(movies)[1]
+```
+
+The movies dataset includes 3883 films from the years 1919 to 2000.
+
+### 1.2 Preprocess ratings dataset
+
+```{r message=FALSE, warning=FALSE}
+# define the minimal number of ratings a movie should have to be considered in the recommendation analysis
+n_ratings_cutoff = 50
+clean_rating = ratings %>%
+           mutate(user = paste0("u", UserID), item = paste0("i", MovieID))
+n_item = clean_rating %>% group_by(item) %>% summarize (n = n()) %>% arrange(n)
+n_item$pos = 1:nrow(n_item)
+clean_rating = clean_rating %>% 
+               semi_join(n_item %>% filter(n>=n_ratings_cutoff))
+avg_rating = clean_rating %>% group_by(MovieID) %>% summarize(avg_rating = mean(Rating), n=n()) %>% arrange(-avg_rating)
+
+# save only the rating summary to be used in the Shiny App to avoid reading a large rating dataset again
+write.csv(avg_rating, "C:/Gunther/OneDrive - University of Illinois - Urbana/Documents/Github/Movies/avg_rating.csv",
+          row.names = FALSE)
+movies = movies %>% inner_join(avg_rating, by = "MovieID")
+# calculate how many movies are excluded from the dataset
+movies_excl = as.numeric(table(n_item$n<n_ratings_cutoff)[2])
+movies_excl_rat = sum(n_item[1:movies_excl,"n"])
+
+ratings_matrix = clean_rating %>% select(user, item, Rating)
+# create the disperse matrix to be used by the different collaborative recommendation algorithms
+ratings_matrix = as(ratings_matrix, "realRatingMatrix")
+dim(ratings_matrix)
+```
+
+Ratings dataset includes more than 1M of observations for 3706 movies.
+
+To avoid that a small number of users influence the move rating significantly, I excluded the movies with less than 50 ratings.
+
+This also address the problem of observations in the movies dataset with missing ratings, what could generate rating matrices with different column dimensions between the matrix used to train the model and the matrix used to predict missing ratings.
+
+I also created the ratings_matrix as a realRatingMatrix from the ratings dataset, adjusted for reviews of movies with at least 50 ratings.
+
+### 1.3 Show representation of movies and reviews excluded
+
+In figure 1, the graph on the left shows that 1192 movies with less than 50 ratings were excluded from the recommendation. This number is equivalent of 32.16% of the movies originally rated, but it represents only 6% of all ratings as shows by the graph on the right.  
+
+```{r fig.height=4, fig.width=10, fig.cap = "Figure 1. Understand number of movies removed"}
+plot1 = ggplot(data = n_item, aes(y = pos, x = n)) +
+  geom_line() + geom_vline(xintercept = n_ratings_cutoff, linetype = 2, color = "red") +
+  geom_hline(yintercept = movies_excl, linetype = 2, color = "red") +
+  annotate(geom = "text", x = 1650, y=1450, color = "darkred",
+           label = paste0(movies_excl, " movies (",
+           round(100*movies_excl/nrow(n_item),2),"%) have less than ", n_ratings_cutoff, " reviews")) +
+  labs(x = "Ratings per Movie", y="Accumulated Number of Movies", title = "Number of Movies vs. Ratings per Movie")
+plot2 = ggplot(data = n_item, aes(y = cumsum(n), x = n)) +
+  geom_line() + geom_vline(xintercept = n_ratings_cutoff, linetype = 2, color = "red") + 
+  geom_hline(yintercept = movies_excl_rat, linetype = 2, color = "red") +
+  annotate(geom = "text", x = 1700, y=100000, color = "darkred",
+           label = paste0(movies_excl, " movies represent ",
+                          movies_excl_rat, " reviews (",round(movies_excl_rat/nrow(n_item),2),"%)")) +
+  labs(x = "Ratings per Movie", y = "Accumulated Number of Reviews", title = "Total Number of Ratings vs. Ratings per Movie")
+plot1 + plot2
+```
+
+### 1.4 Histogram of distributions
+
+After excluding movies with less than 50 ratings, the new movie dataset includes a total of 2019 movies. Figure 2 shows how the ratings are distributed for these movies, a left skewed graph with median between 3 and 4.
+
+```{r fig.height=3, fig.width=8, fig.cap = "Figure 2. Histogram of rating distributions"}
+tmp = data.frame(Rating = 1:5, 
+                 freq = as.vector(table(clean_rating$Rating)/nrow(clean_rating)))
+ggplot(data = tmp, aes(x = Rating, y = freq)) +
+  geom_bar(stat="identity", fill = 'steelblue', width = 0.6) + 
+  geom_text(aes(label=round(freq, dig=2)), vjust=1.6, color="white", size=3.5) +
+  theme_minimal()
+```
+
+# 2. System I: Recommendation Based on Genre
+
+For the first system, I will provide two recommendation schemes for a user interested in Horror movies.
+
+### 2.1 Recommendation 1
+
+For the first scheme, I will recommend the top-six highly-rated Horror movies defined based on the highest average ratings produced between 1970 and 2000. To avoid individual users to influence the ratings too much, I only considered movies rated by at least 50 other users (I used the modified dataset movies, already filtered  for n>=50).
+
+```{r}
+genre = "Horror"
+genre_result = movies  %>% 
+  filter(Year>=1970, grepl(genre, Genres)) %>%
+  select(Title, Genres, avg_rating, Year) %>%
+  arrange(-avg_rating)
+genre_result[1:6,]
+```
+
+
+## 2.2 Recommendation 2
+
+For the second scheme, I will recommend the top-six most popular pure-horror movies using the recommender algorithm "POPULAR" from recommenderlab package. The term pure-horror here means only movies that have the main genre (first classification) as horror. This assumes that having horror as first genre classification has more relevance to select genuine and scaring horror-movies, creating better recommendations.
+
+"POPULAR" recommender algorithm uses a simple average of existing ratings per movie plus the average of item ratings added for prediction to predict missing ratings and rank them. POPULAR recommendation doesn't change with only some new ratings. As I am not predicting new input ratings, I used the topN items provided by POPULAR recommender to list the top 6 values.
+
+```{r}
+df_genre = movies %>% filter(str_sub(Genres, 1, str_length(genre)) == genre) %>%
+  left_join(clean_rating, by = "MovieID") %>%
+  mutate(user = paste0("u", UserID), item = paste0("i", MovieID), rating = Rating) %>%
+  select(user, item, rating)
+genre_matrix = as(df_genre, "realRatingMatrix")
+r = Recommender(as(df_genre, "realRatingMatrix"), method = "POPULAR")
+top_popular = as(getModel(r)$topN, "list")[[1]][1:6]
+top_popular = data.frame(item = top_popular)
+top_popular = top_popular %>% left_join(movies, by = "item")
+# Show top 
+top_popular[1:6,c("Title", "Genres")]
+```
+
+In this second recommendation we see that movies like "Young Frankenstein" and "Ghostbusters", although classified as horror, have comedy as their first genre classification. For somebody looking for a pure and scaring horror movie, calling these to movies as horror may sound a bit strange, what makes the recommendation 2 very selective.
+
+Although the recommendation 2 is more specific and targeted, I decided to deploy the recommendation 1 to my Shiny App because 1-) provide a more broad recommendation to end-users (assuming we have more users looking for broad recommendations than very selective ones), 2-) for some genres the second recommendation provided much less than 10 recommendations.
+
+
+# 3. System II: Collaborative Recommendation System
+
+
+### 3.1 Compare recommender algorithms
+
+As collaborative recommendation system, I analyzed 3 different algorithms:
+
+- UBCF: Recommender based on user-based collaborative filtering, which predicts ratings based on the similarity of a new user with each existing users. The average ratings of the missing items are defined based on these existing users, using or not weighed values for their similarity.
+
+- IBCF: Recommender based on item-based collaborative filtering, which predict ratings based on the proximity of similar items. The similarity of ratings for all pair of items is calculated, the k most similar items are identified, and for each user, the items with best match are included.
+
+- SVD: Recommender based on SVD approximation with column-mean imputation and it uses a matrix factorization-based algorithm through singular value composition. It became more popular for recommender system when it used in the Netflix $1million competition by Simon Funk.
+
+For UBCF and IBCF, different similarity methods are available, including "cosine" and "pearson". For the analysis in this report, I used the standard similarity value "cosine". In addition, it is possible to specify different values for the normalization for UBCF and IBCF, including "center" (mean of ratings are subtracted from every rating) and "z-score" (normal distribution). I also adopted the standard normalize value "center" for the rating matrix. This means that no normalization is necessary as the recommenderlab functions use "center" normalization. 
+
+I added the two algorithms below only to serve as benchmark, but they are not good candidates for System II:
+
+- RANDOM: Algorithm that produces random recommendations.
+
+- POPULAR: Recommender based on item popularity, which uses a simple average of existing ratings per movie plus the average of item ratings added for prediction.
+
+Different metrics are available to measure accuracy/error of these models, including RMSE, MSE and MAE. I chose RMSE, which was also used as metric in the $1M Netflix recommender competition.
+
+To evaluate the prediction performance, I used 10 iterations, and for each iteration I split the dataset in 80% training data and 20% test data using recommenderlab's function evaluationscheme. I also used goodRating as 0 (center of the normalized rating value) and the Given-3 protocol, where three randomly selected items are withheld for evaluation.
+
+Initially, I used the models with defaul parameter values for a broad analysis, then chose the best ones and tuned them in order to find the best model (with the lowest test RMSE).
+
+For the first time I used the foreach library, what saved some substantial processing time running the 10 iterations as well as in the tuning process.
+
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1234)
+iter = 1:10
+model = list("Random"  = list(name="Random",  param=NULL),
+             "Popular" = list(name="Popular", param=NULL),
+             "UBCF"    = list(name="UBCF",    param=list(nn=50)),
+             "IBCF"    = list(name="IBCF",    param=list(k=50)),
+             "SVD"     = list(name="SVD",     param=list(k=50)))
+m = length(model)
+registerDoFuture()
+plan(multisession)
+results = foreach(trial = iter) %dopar% {
+    metrics = data.frame(iter=rep(0, m), model=rep("",m), RMSE=rep(0,m), MSE=rep(0,m), MAE=rep(0,m))
+    scheme = evaluationScheme(ratings_matrix,
+                              method="split",
+                              train = 0.80,
+                              given=3,
+                              goodRating = 0)
+    res = evaluate(scheme, model, type = "ratings", progress = FALSE)
+    for (k in 1:m) {
+          metrics[k,1] = trial
+          metrics[k,2] = model[[k]]$name
+          metrics[k,3:5] = unlist(avg(res)[k])
+    }
+    metrics
+}
+r = results
+results = bind_rows(results)
+(results = results %>% arrange(iter, model))
+```
+
+### 3.2 Plot comparasion of all algorithms
+
+```{r fig.cap = "Figure 3. RMSE for 5 recommender models using 10 iterations"}
+ggplot(results, aes(x = model, y=RMSE, fill = model)) + geom_boxplot() + guides(fill=FALSE)
+```
+
+Figure 3 shows that the POPULAR, SVD and UBCF algorithms had the best RMSE results, not too far from each other, all of them with low variance using 10 iterations. 
+
+IBCF showed a high RMSE median, with high variance, so I discarded this method. As mentioned before, I also discarded the two benchmark algorithms: RANDOM and POPULAR. 
+
+Although POPULAR model has good RMSE, it is not an appropriated algorithm for system II. In system I (recommendation 2), the POPULAR model was used because there is no input from new users, and I just extracted the topN recommendations based on the average rates. However POPULAR is not an appropriated model for recommendations using new ratings of new users. It requires a huge amount of new ratings to change the sequence of recommendations, specially due to the size of existing rating dataset. This is not what end-users expect from a recommender system App, as they normally add some new ratings and wait for fresh recommendations.
+
+SVD and UBCF are the two models I pre-selected. Next I will tune their parameters to define the best model with lowest RMSE.
+
+### 3.3 Parameters of SVD and UBCF models
+
+```{r}
+unlist((recommenderRegistry$get_entries(dataType="realRatingMatrix")$SVD_realRatingMatrix)$parameters)
+```
+
+The SVD model has 3 parameters: **k**, **maxiter** and **normalize**. Except for values very low of **maxiter** (less than 20), this parameter produces very stable RMSEs, so I didn`t tune it and just used the default value 100.
+
+I focused the tuning of SVD model in the parameters **k** and **normalize**. The parameter **normalize** defines the type of normalization is used by both SVD and UBCF, either by subtracting the mean ("center") or applying a normal standard distribution ("Z-score"). By default, the recommender function apply normalization ("center") to the rating matrix.
+
+SVD uses factorization of user-item-rating matrix (utility matrix) through singular value decomposition. finding the factors of matrices, and reducing the number of features of matrix from N-dimension to k-dimension by extracting its latent factors. It maps each user and each item into a r-dimensional latent space. **k** is the parameter I will be tuning.
+
+Below the function to be minimized by the SVD model [Analytics India Magazine](https://analyticsindiamag.com/singular-value-decomposition-svd-application-recommender-system/), including the regularization and bias terms to avoid overfitting, with r(ui) as the expected rating in the i x u rating matrix, (mu) the average of all ratings, b(i) as the average rating of items i minus (mu), and b(u) the average rating given by user u minus (mu).
+
+![](SVDFormula.JPG)
+
+
+```{r}
+unlist((recommenderRegistry$get_entries(dataType="realRatingMatrix")$UBCF_realRatingMatrix)$parameters)
+```
+
+UBCF assumes that users with similar preferences will rate items similarly and the missing ratings can be predicted by aggregate the ratings of neighborhood users, defined in terms of similarity between users given number of **nn** (parameter) nearest neighbors. Parameter **method** defines the simililarity measure, and "cosine" (default) and "pearson"are the most popular. Parameter **weighted** defines if a weighted value for the similarity measure is used or not.
+
+Below the formula ([Michael Hahsler, recommenderlab paper](https://cran.r-project.org/web/packages/recommenderlab/vignettes/recommenderlab.pdf)) of predicted rating using the neighbohood and weights of similarity values:
+
+![](UBCFFormula.JPG)
+
+UBCF includes more parameters than SVD model. Unfortunately the parameter **method** showed some instability for the pearson correlation as a similarity measure for some very sparse matrices. This is a documented issue, and I expect that the next versions of recommenderlab package addresses the issue. So, I used the default "cosine" value for this parameter. 
+
+I focused the tuning of UBCF model in the parameters **nn**, **weighted** and **normalize**. I keep the 80%/20% split for training and test data, goodRating as 0 (center of the normalized rating value) and kept the Given-3 protocol.
+
+
+### 3.4 Tune parameter k for SVD model
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1234)
+scheme = evaluationScheme(ratings_matrix, method="split", train = 0.8, given=3, goodRating=0)
+grid = c(2, 5, 7, seq(10, 100, 5))
+registerDoFuture()
+plan(multisession)
+results = foreach(trial = grid) %dopar% {
+  rmse = c(k=0, RMSE=0)
+  modelsvd = list("SVD" = list(name="SVD", param=list(k = trial)))
+  res = evaluate(scheme, modelsvd, type = "ratings", progress = FALSE)
+  rmse[1] = trial
+  rmse[2] = getConfusionMatrix(res[[1]])[[1]][1]
+  rmse
+}
+# show the lowest RMSE of the search grid
+(results = bind_rows(results) %>% arrange(RMSE))[1:5,]
+```
+
+### 3.5 Plot the tuning graph for the parameter k of SVD model
+
+```{r, fig.cap = "Figure 4. RMSE of SVD model for different values of K"}
+best_k = results$k[1]
+best_svdRMSE = round(results$RMSE[1],4)
+ggplot(results, aes(x = k, y = RMSE)) + geom_line(color = "darkblue") +
+  annotate(geom="text", x = best_k+16.56, y = results$RMSE[1]-3e-6, color = "red",
+           label=paste0("* Best RMSE (", best_svdRMSE,") for k =",best_k)) +
+  labs(title = "RMSE of SVD Models for Different Values of K")
+```
+
+From figure 4 we see that SVD model has the best RMSE = `r best_svdRMSE` for K = `r best_k`.
+
+### 3.6 Tune parameter normalize for SVD model
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1234)
+grid = c("center", "Z-score")
+registerDoFuture()
+plan(multisession)
+results = foreach(trial = grid) %dopar% {
+  rmse = data.frame(normalize="", RMSE=0)
+  model = list("SVD" = list(name="SVD", param=list(k = best_k, normalize = trial)))
+  res = evaluate(scheme, model, type = "ratings", progress = FALSE)
+  rmse[1] = trial
+  rmse[2] = getConfusionMatrix(res[[1]])[[1]][1]
+  rmse
+}
+(results = bind_rows(results) %>% arrange(RMSE))
+best_svdnorm = results$normalize[1]
+best_svdRMSE = round(results$RMSE[1],4)
+```
+
+After tuning the parameters of SVD model, we have the best (lowest) RMSE = `r best_svdRMSE` for K = `r best_k` and normalize = `r best_svdnorm`.
+
+### 3.7 Tune parameter nn for UBCF model
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1234)
+grid = c(2, 5, 10, 20, 30, seq(40,200,20))
+registerDoFuture()
+plan(multisession)
+results = foreach(trial = grid) %dopar% {
+  rmse = data.frame(nn=0, RMSE=0)
+  model= list("UBCF" = list(name="UBCF", param=list(nn = trial)))
+  res = evaluate(scheme, model, type = "ratings", progress = FALSE)
+  rmse[1] = trial
+  rmse[2] = getConfusionMatrix(res[[1]])[[1]][1]
+  rmse
+}
+(results = bind_rows(results) %>% arrange(RMSE))
+best_nn = results$nn[1]
+best_ubcfRMSE = round(results$RMSE[1],4)
+```
+
+In my grid search, I considered values of nn parameter up to 200 to avoid instability in the prediction model with the existing rating matrix.
+
+### 3.8 Plot the tuning graph for the parameter nn of UBCF model
+
+```{r, fig.cap = "Figure 5. RMSE of UBCF model for different values of nn"}
+best_nn = results$nn[1]
+best_ubcfRMSE = round(results$RMSE[1],4)
+ggplot(results, aes(x = nn, y = RMSE)) + geom_line(color = "darkblue") +
+  annotate(geom="text", x = 100, y = (results$RMSE[1]+results$RMSE[nrow(results)])/2, color = "red",
+           label=paste0("Best RMSE = ", best_ubcfRMSE," for nn =",best_nn)) +
+  labs(title = "RMSE of UBCF Models for Different Values of nn")
+```
+
+From figure 5 we see that UBCF model has the best RMSE = `r best_ubcfRMSE` for nn = `r best_nn`.
+
+### 3.9 tune normalize parameter for UBCF model
+
+```{r}
+grid = c("center", "Z-score")
+registerDoFuture()
+plan(multisession)
+results = foreach(trial = grid) %dopar% {
+  rmse = data.frame(normalize="", RMSE=0)
+  modelsvd = list("UBCF" = list(name="UBCF", param=list(nn=200, normalize = trial)))
+  res = evaluate(scheme, modelsvd, type = "ratings", progress = FALSE)
+  rmse[1] = trial
+  rmse[2] = getConfusionMatrix(res[[1]])[[1]][1]
+  rmse
+}
+# show the lowest RMSE of the search grid
+(results = bind_rows(results) %>% arrange(RMSE))
+best_ubcfnorm = results[1,"normalize"]
+best_ubcfRMSE = round(results$RMSE[1],4)
+```
+
+From the tuning process of UBDF model, we have the best RMSE = `r best_ubcfRMSE` for normalize = "center". So, I kept the default normalization value as "center".
+
+### 3.10 tune weighted parameter for UBCF model
+
+```{r}
+grid = c(TRUE, FALSE)
+registerDoFuture()
+plan(multisession)
+results = foreach(trial = grid) %dopar% {
+  rmse = data.frame(weighted=TRUE, RMSE=0)
+  modelsvd = list("UBCF" = list(name="UBCF", param=list(nn=200, weighted = trial)))
+  res = evaluate(scheme, modelsvd, type = "ratings", progress = FALSE)
+  rmse[1] = trial
+  rmse[2] = getConfusionMatrix(res[[1]])[[1]][1]
+  rmse
+}
+# show the lowest RMSE of the search grid
+(results = bind_rows(results) %>% arrange(RMSE))
+best_ubcfweighted = results[1,"weighted"]
+best_ubcfRMSE = round(results$RMSE[1],4)
+```
+
+From the tuning process of UBDF model, we have the best RMSE = `r best_ubcfRMSE` for weighted = FALSE. This new setup was incorporated to the model.
+
+This conclude the tuning of UBDF model, with nn = 200, weighted = FALSE and normalize = "center".
+
+### 3.11 Choose the final model
+
+After tuning the SVD and UBCF models, I selected the UBCF algorithm, which has the lowest RMSE, as the final model.
+
+I saved the final UBCF model locally as a rds file and then deployed in my github project folder:
+[https://github.com/gcbacel/Movies](https://github.com/gcbacel/Movies)
+
+Reading the UBCF model from a .rds file as well as the average ratings of movies from my GitHub reduces significantly the time the Shiny App can provide a recommendation, avoiding the long processing time to train the model.
+
+```{r message=FALSE, warning=FALSE}
+modelubcf = Recommender(ratings_matrix, method = "UBCF", list(nn=200,
+                                                              weighted = FALSE,
+                                                              normalize = "center"))
+# save UBCF model to be used in the Shiny App.
+saveRDS(modelubcf, "C:/Gunther/OneDrive - University of Illinois - Urbana/Documents/Github/Movies/modelubcf.rds")
+```
+
+### 3.12 Simulate results
+
+Using the tuned UBCF model, I am simulating a new user randomly adding 20 movie ratings between 1-5
+
+```{r}
+# create an empty 1xn matrix with all n movies item as columns, to be used as input matrix
+rating_matrix = data.table(matrix(rep(NA,nrow(movies)), nrow = 1))
+colnames(rating_matrix) =paste0("i", avg_rating$MovieID)
+
+# Simulate a new user randomly rating movies
+new_ratings = function(n = 10) {
+  input = data.frame(matrix(rep(0, n*2), ncol=2))
+  colnames(input) = c("MovieID", "Rating")
+  for (i in 1:n) {
+      input[i,1] = sample(movies$MovieID, 1)
+      input[i,2] = round(runif(1,1, 5),0)
+  }
+  return(input)
+}
+
+movie_detail = function(vector_movies) {
+  tmp = c(vector_movies)
+  return (movies %>% filter(MovieID %in% tmp) %>% select (Title, Genres))
+}
+
+predict_top_movies = function(input_ratings) {
+    input = as.matrix(rating_matrix)
+    colnames(input) = paste0("i",movies$MovieID)
+    for (i in 1:nrow(input_ratings)) {
+        item = paste0("i", input_ratings$MovieID[i])
+        input[1,item] = input_ratings$Rating[i]
+    }
+    recom = predict(modelubcf, as(input, "realRatingMatrix"), n=10)
+    top10 = bestN(recom, n = 10)
+    top10 = as(top10, "list")[[1]]
+    top10 = as.numeric(str_sub(top10, 2, -1))
+    return(top10)
+}
+```
+
+Adding 6 new random rating values to 6 movies below selected randomly:
+
+```{r}
+input = new_ratings(n=6)
+movie_detail(input$MovieID)
+```
+
+Based on these inputs, the UBCF model recommends these 10 movies:
+
+```{r}
+pred = predict_top_movies(input)
+movie_detail(pred)
+```
+
+
+
+# 4. EXTRA: Explanation of Shiny App
+
+My shiny movie recommendation App is published and running at [https://gunther-bacellar.shinyapps.io/RecommenderSystem/](https://gunther-bacellar.shinyapps.io/RecommenderSystem/)
+
+The code for this App is available in my github [HERE](https://github.com/gcbacel/Movies) and the code below is the same used by the App. The the core of App code was included in this session just to provide a brief explanation.
+
+The Shiny App implemented System II model (UBCF) through the tabs "STEP 1" and "STEP 2", and implemented the System I in the "BONUS" tab.
+
+To avoid to have always the same sequence of movies waiting to be rated by users, I shuffle the list of movies and show a new list every time the user open the App. The movie dataset only includes movies with at least 50 ratings to avoid few users influence the movie ratings too much.
+
+In the scenario that a user ask for recommendation without adding any new rating, the recommendation provides a fixed list of the movies with the highest average ratings.
+
+
+```{r}
+# cleaning all variables in the system to simulate the code runnning in the Shiny app
+rm(list = ls())
+```
+
+
+### 4.1 Code deployed in the App at Steps 1 and 2 (System II)
+
+```{r}
+predict_top_movies = function(input_ratings) {
+    input = as.matrix(rating_matrix)
+    colnames(input) = paste0("i",movies$MovieID)
+    for (i in 1:nrow(input_ratings)) {
+        item = paste0("i", input_ratings$MovieID[i])
+        input[1,item] = input_ratings$Rating[i]
+    }
+    recom = predict(modelubcf, as(input, "realRatingMatrix"), n=10)
+    recom3 = bestN(recom, n = 10)
+    top10 = as(recom3, "list")[[1]]
+    top10 = as.numeric(str_sub(top10, 2, -1))
+    return(top10)
+}
+myurl = "https://raw.githubusercontent.com/gcbacel/Movies/main/"
+avg_rating = read.csv(paste0(myurl, "avg_rating.csv"))
+movies = readLines(paste0(myurl, "movies.dat"))
+movies = strsplit(movies, split = "::", fixed = TRUE, useBytes = TRUE)
+movies = matrix(unlist(movies), ncol = 3, byrow = TRUE)
+movies = data.frame(movies, stringsAsFactors = FALSE)
+colnames(movies) = c('MovieID', 'Title', 'Genres')
+movies$MovieID = as.integer(movies$MovieID)
+movies$item = paste0("i",movies$MovieID)
+movies = movies %>% inner_join(avg_rating, by = "MovieID")
+movies$Title = iconv(movies$Title, "latin1", "UTF-8")
+movies$Year = as.numeric(unlist(
+    lapply(movies$Title, function(x) substr(x, nchar(x)-4, nchar(x)-1))))
+small_image_url = "https://github.com/gcbacel/Movies/blob/main/Images/"
+movies$image_url = sapply(movies$MovieID, 
+                          function(x) paste0(myurl, "Images/", x, '.jpg?raw=true'))
+rating_matrix = data.table(matrix(rep(NA,nrow(movies)), nrow = 1))
+colnames(rating_matrix) =paste0("i", avg_rating$MovieID)
+modelubcf = readRDS(gzcon(url(paste0(myurl, "modelubcf.rds"))))
+```
+
+
+### 4.2 simulate some new ratings and show the recommendations
+
+```{r}
+# Simulate a new user adding some movie ratings
+new_ratings = data.frame(MovieID = c(111, 1527, 3702, 3535, 1653),
+                     Rating  = c(3, 5, 5, 3, 5))
+movies %>% inner_join(new_ratings, by = "MovieID") %>% select (Title, Genres, Rating)
+```
+
+The UBCF model recommends these 10 movies based on my input ratings:
+
+```{r}
+pred = predict_top_movies(new_ratings)
+movies %>% filter(MovieID %in% pred) %>% select (Title, Genres)
+```
+
+From this simulation, I gave good ratings for Sci-Fi movies and it returned many Sci-Fi recommendations. Majority of the recommended movies I already watched and liked them.
+
+### 4.3 Code deployed in the App as Bonus (System I)
+
+As a fan of Sci-Fi movies, the App is recommending me these movies:
+
+```{r}
+genre = "Sci-Fi"
+genre_result = (movies  %>% 
+                filter(Year>=1970, grepl(genre, Genres)) %>%
+                arrange(-avg_rating))[1:10,]
+genre_result[, c("Title", "Genres")]
+```
+
+
+REFERENCE:
+
+To created my Shiny App I used as reference and adapted the code available for a Book Recommender System [https://github.com/pspachtholz/BookRecommender](https://github.com/pspachtholz/BookRecommender)
+
